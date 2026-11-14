@@ -1,0 +1,19 @@
+[Unit]
+Description=HomeCam Seguranca NVR 24/7 Headless (Gravacao + IA + Portal Web)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homecam/HomeCamSeguranca
+EnvironmentFile=-/opt/homecam/HomeCamSeguranca/.env
+# Impede suspensao automatica do servidor Linux enquanto o NVR estiver rodando
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=HomeCamSeguranca --why="Gravacao CCTV e IA 24/7" /opt/homecam/HomeCamSeguranca/.venv/bin/python main.py --headless --web-port 8765
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+

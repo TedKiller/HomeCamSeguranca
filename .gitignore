@@ -1,0 +1,52 @@
+# Ambiente virtual e cache Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Credenciais, tokens OAuth, variaveis e configuracao local (contem DPAPI/IPs/chaves)
+secrets/
+.env
+.env.*
+!.env.example
+config.json
+config.tmp
+!config.example.json
+pending_uploads.json
+pending_uploads_uploaded.json
+*.token.json
+
+# Modelos ONNX baixados em tempo de execucao (baixados automaticamente pelo app)
+models/
+*.onnx
+*.onnx.data
+
+# Gravacoes, snapshots, cache de playback DVR, CSVs operacionais e logs
+gravacoes/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.csv
+*.log
+*.log.old
+*.tmp
+
+# Estado local de VPN/containers
+deploy/tailscale-state/
+
+# Arquivos temporarios de sistema e IDEs
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/

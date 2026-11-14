@@ -1,0 +1,61 @@
+{
+  "selected_camera_id": "cam-principal",
+  "cameras": [
+    {
+      "id": "cam-principal",
+      "name": "Camera Principal",
+      "brand": "Xiongmai NetIP / iCSee (Porta 34567)",
+      "ip": "192.168.1.100",
+      "rtsp_port": 34567,
+      "onvif_port": 8899,
+      "username": "admin",
+      "password": "",
+      "channel": 1,
+      "stream_type": "main",
+      "custom_rtsp_url": "",
+      "usb_index": 0,
+      "source_url_override": "",
+      "serial_number": "",
+      "ptz_speed": 5,
+      "ptz_home_preset": 100,
+      "ptz_auto_return_enabled": false,
+      "ptz_auto_return_seconds": 30
+    }
+  ],
+  "recording": {
+    "recordings_dir": "./gravacoes",
+    "segment_minutes": 5,
+    "motion_only": false,
+    "motion_sensitivity": 0.015,
+    "motion_post_seconds": 12,
+    "auto_start_recording": true,
+    "auto_connect_on_startup": true
+  },
+  "drive": {
+    "enabled": false,
+    "sync_mode": "oauth",
+    "local_drive_dir": "",
+    "credentials_path": "./secrets/credentials.json",
+    "token_path": "./secrets/token.json",
+    "root_folder_name": "HomeCamSeguranca",
+    "delete_after_upload": false,
+    "auto_upload": true
+  },
+  "ai": {
+    "enabled": true,
+    "show_overlays": true,
+    "analysis_fps": 6.0,
+    "detect_people_gender": true,
+    "detect_animals": true,
+    "detect_vehicles_alpr": true,
+    "save_csv_log": true,
+    "csv_log_path": "./gravacoes/veiculos_detectados.csv",
+    "people_csv_log_path": "./gravacoes/pessoas_detectadas.csv"
+  },
+  "web": {
+    "enabled": false,
+    "host": "0.0.0.0",
+    "port": 8765,
+    "auth_token": ""
+  }
+}

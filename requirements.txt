@@ -1,0 +1,14 @@
+opencv-python>=4.9.0
+pillow>=10.0.0
+imageio-ffmpeg>=0.5.1
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+onnxruntime-directml>=1.24.0
+fast-alpr>=0.4.0
+fast-plate-ocr>=1.1.0
+open-image-models>=0.6.0
+tokenizers>=0.20.0
+huggingface-hub>=0.25.0
+pyyaml>=6.0.0
+

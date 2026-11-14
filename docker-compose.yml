@@ -1,0 +1,50 @@
+services:
+  homecam-nvr:
+    build:
+      context: .
+      args:
+        # Use ORT_PACKAGE=onnxruntime-gpu ao rodar em VPS/Servidor com NVIDIA GPU
+        ORT_PACKAGE: ${ORT_PACKAGE:-onnxruntime}
+    container_name: homecam-nvr-24h
+    restart: unless-stopped
+    shm_size: "1gb"
+    ports:
+      - "${HOMECAM_WEB_PORT:-8765}:8765"
+    environment:
+      TZ: America/Sao_Paulo
+      HOMECAM_CONFIG_PATH: /data/config.json
+      HOMECAM_RECORDINGS_DIR: /data/gravacoes
+      HOMECAM_DRIVE_CREDENTIALS: /data/secrets/credentials.json
+      HOMECAM_DRIVE_TOKEN: /data/secrets/token.json
+      HOMECAM_CAM_PASSWORD: ${HOMECAM_CAM_PASSWORD:-}
+      HOMECAM_RTSP_URL: ${HOMECAM_RTSP_URL:-}
+      HOMECAM_WEB_TOKEN: ${HOMECAM_WEB_TOKEN:-}
+    volumes:
+      - ./config.json:/data/config.json:ro
+      - ./gravacoes:/data/gravacoes
+      - ./secrets:/data/secrets
+    # Para GPU NVIDIA em VPS Cloud (RunPod/AWS/GCP) ou Jetson Orin, descomente abaixo:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Sidecar opcional Tailscale VPN para conectar servidor em nuvem as cameras da sua rede local sem abrir portas no roteador:
+  # tailscale:
+  #   image: tailscale/tailscale:latest
+  #   container_name: homecam-tailscale
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   environment:
+  #     TS_AUTHKEY: ${TS_AUTHKEY:-}
+  #     TS_STATE_DIR: /var/lib/tailscale
+  #   volumes:
+  #     - ./deploy/tailscale-state:/var/lib/tailscale
+  #     - /dev/net/tun:/dev/net/tun
+  #   cap_add:
+  #     - NET_ADMIN
+  #     - SYS_MODULE
+

@@ -305,6 +305,76 @@ def is_ir_frame(frame_bgr: np.ndarray) -> bool:
     return diff_rg < 2.2 and diff_gb < 2.2
 
 
+def compute_gray_world_gains(frame_bgr: np.ndarray) -> tuple[float, float, float]:
+    """Calcula ganhos Gray World (B, G, R) amortecidos para corrigir viés cromático da câmera CCTV."""
+    if frame_bgr is None or frame_bgr.size == 0 or frame_bgr.ndim != 3:
+        return (1.0, 1.0, 1.0)
+    h, w = frame_bgr.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > 160:
+        scale = 160.0 / float(max_dim)
+        small = cv2.resize(
+            frame_bgr,
+            (max(8, int(round(w * scale))), max(8, int(round(h * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        small = frame_bgr
+
+    b_ch, g_ch, r_ch = cv2.split(small)
+    valid = (
+        (np.maximum(np.maximum(b_ch, g_ch), r_ch) < 248)
+        & (np.minimum(np.minimum(b_ch, g_ch), r_ch) > 10)
+    )
+    if int(np.count_nonzero(valid)) < 32:
+        valid = np.ones(b_ch.shape, dtype=bool)
+
+    mb = float(np.mean(b_ch[valid]))
+    mg = float(np.mean(g_ch[valid]))
+    mr = float(np.mean(r_ch[valid]))
+    # Se a cena já for quase acromática (ex.: IR), não aplica ganho forte
+    if abs(mr - mg) < 2.2 and abs(mg - mb) < 2.2:
+        return (1.0, 1.0, 1.0)
+
+    avg = (mb + mg + mr) / 3.0
+    if avg < 8.0:
+        return (1.0, 1.0, 1.0)
+
+    def _gain(mean_val: float) -> float:
+        raw = avg / max(12.0, mean_val)
+        damped = 1.0 + 0.75 * (raw - 1.0)
+        return max(0.72, min(1.38, damped))
+
+    return (_gain(mb), _gain(mg), _gain(mr))
+
+
+def _apply_wb_gains(
+    roi_bgr: np.ndarray,
+    gains_bgr: tuple[float, float, float] | None = None,
+    *,
+    local_strength: float = 0.25,
+) -> np.ndarray:
+    """Aplica correção de balanço de branco (ganhos globais + ajuste local suave) em BGR."""
+    work = roi_bgr.astype(np.float32)
+    if gains_bgr is not None and gains_bgr != (1.0, 1.0, 1.0):
+        gb, gg, gr = gains_bgr
+        work[:, :, 0] *= float(gb)
+        work[:, :, 1] *= float(gg)
+        work[:, :, 2] *= float(gr)
+    elif local_strength > 0.0:
+        # Ajuste local contido para neutralizar sombra fria sem apagar carros/roupas saturados
+        mb = float(np.mean(work[:, :, 0]))
+        mg = float(np.mean(work[:, :, 1]))
+        mr = float(np.mean(work[:, :, 2]))
+        avg = (mb + mg + mr) / 3.0
+        spread = max(mb, mg, mr) - min(mb, mg, mr)
+        if avg > 12.0 and spread < 45.0:
+            for c_idx, m_val in enumerate((mb, mg, mr)):
+                g = 1.0 + local_strength * ((avg / max(12.0, m_val)) - 1.0)
+                work[:, :, c_idx] *= max(0.84, min(1.18, g))
+    return np.clip(work, 0.0, 255.0).astype(np.uint8)
+
+
 def _classify_roi_color(
     roi_bgr: np.ndarray,
     *,
@@ -312,8 +382,9 @@ def _classify_roi_color(
     suppress_skin: bool = False,
     apply_center_weight: bool = True,
     allow_ir: bool | None = None,
+    wb_gains: tuple[float, float, float] | None = None,
 ) -> str:
-    """Classifica cor predominante via espaço perceptual CIELAB + HSV com votação espacial ponderada."""
+    """Classifica cor predominante via BGR->RGB->CIELAB/HSV com Gray World e contingência."""
     if roi_bgr is None or roi_bgr.size == 0 or min(roi_bgr.shape[:2]) < 8:
         return "Indefinida"
 
@@ -338,9 +409,13 @@ def _classify_roi_color(
         if allow_ir is None and 55.0 <= float(np.mean(g)) <= 195.0:
             return "P&B (Noturno IR)"
 
-    wh, ww = roi_work.shape[:2]
-    hsv = cv2.cvtColor(roi_work, cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    lab = cv2.cvtColor(roi_work, cv2.COLOR_BGR2Lab).reshape(-1, 3)
+    # Correção de balanço de branco (Gray World) + conversão explícita BGR -> RGB -> HSV / Lab
+    roi_wb = _apply_wb_gains(roi_work, wb_gains, local_strength=0.25)
+    roi_rgb = cv2.cvtColor(roi_wb, cv2.COLOR_BGR2RGB)
+
+    wh, ww = roi_rgb.shape[:2]
+    hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV).reshape(-1, 3)
+    lab = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2Lab).reshape(-1, 3)
 
     if apply_center_weight:
         yy = np.linspace(-1.0, 1.0, wh, dtype=np.float32)[:, None]
@@ -357,18 +432,25 @@ def _classify_roi_color(
     b_off = lab[:, 2].astype(np.float32) - 128.0
     chroma = np.hypot(a_off, b_off)
 
-    # Filtra sombras/frestas escuras e reflexos estourados preservando carros/roupas pretas ou brancas
-    dark_ratio = float(np.mean(v_vals < 42))
-    bright_ratio = float(np.mean((v_vals > 246) & (chroma < 8.0)))
+    # Preserva pixels escuros reais (carros/roupas pretas), removendo apenas frestas mortas (<12) e estouro especular
+    dark_ratio = float(np.mean(v_vals < 14))
+    bright_ratio = float(np.mean((v_vals > 246) & (chroma < 10.0)))
 
     mask = np.ones(len(hsv), dtype=bool)
-    if dark_ratio < 0.65:
-        mask &= v_vals >= 42
+    if dark_ratio < 0.75:
+        mask &= v_vals >= 12
     if bright_ratio < 0.50:
-        mask &= ~((v_vals > 246) & (chroma < 8.0))
+        mask &= ~((v_vals > 246) & (chroma < 10.0))
+
+    if is_vehicle and np.any(mask):
+        # Ignora reflexo azulado de céu em vidros/capô (alta luminosidade + saturação baixa)
+        sky_glare = (v_vals > 205) & (h_vals >= 84) & (h_vals < 133) & (s_vals < 75) & (chroma < 24.0)
+        non_glare = mask & (~sky_glare)
+        if int(np.count_nonzero(non_glare)) >= max(16, int(0.25 * len(hsv))):
+            mask = non_glare
 
     if suppress_skin and np.any(mask):
-        ycrcb = cv2.cvtColor(roi_work, cv2.COLOR_BGR2YCrCb).reshape(-1, 3)
+        ycrcb = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2YCrCb).reshape(-1, 3)
         cr = ycrcb[:, 1]
         cb = ycrcb[:, 2]
         skin_mask = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127) & (l_lab > 70)
@@ -386,8 +468,15 @@ def _classify_roi_color(
     mc = chroma[mask]
     mw = weights[mask]
 
-    # Região acromática real pelo croma perceptual LAB + guarda para ruído de sombra em baixa luz
-    achrom = (mc < 12.5) | ((ms < 34) & (mc < 20.0)) | ((mv < 50) & (ms < 88) & (mc < 17.5))
+    # Região acromática real + guarda reforçada contra viés azulado em sombras/preto/cinza
+    blue_hue = (mh >= 84) & (mh < 133)
+    weak_blue_cast = blue_hue & ((mc < 22.0) | (ms < 52) | ((mv < 72) & (mc < 28.0)))
+    achrom = (
+        (mc < 16.0)
+        | ((ms < 44) & (mc < 24.0))
+        | ((mv < 68) & (ms < 105) & (mc < 23.0))
+        | weak_blue_cast
+    )
     silver_name = "Prata" if is_vehicle else "Cinza Claro"
 
     scores: dict[str, float] = {}
@@ -428,9 +517,20 @@ def _classify_roi_color(
         else:
             _add("Vinho / Roxo", purple_zone)
 
-    if not scores:
+    total_score = sum(scores.values())
+    if total_score <= 0.0:
         return "Indefinida"
-    return max(scores.items(), key=lambda item: item[1])[0]
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_label, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    conf = best_score / total_score
+    margin = (best_score - second_score) / total_score
+
+    if conf < 0.24 or (len(ranked) > 1 and conf < 0.36 and margin < 0.04):
+        return "Escura" if float(np.median(ml)) < 70.0 else "Indefinida"
+
+    return best_label
 
 
 def estimate_vehicle_color(
@@ -438,6 +538,7 @@ def estimate_vehicle_color(
     vehicle_type: str = "Carro",
     *,
     allow_ir: bool | None = None,
+    wb_gains: tuple[float, float, float] | None = None,
 ) -> str:
     """Estima a cor predominante da lataria/tanque ignorando vidros escuros, sombras e reflexos."""
     if vehicle_crop is None or vehicle_crop.size == 0 or min(vehicle_crop.shape[:2]) < 24:
@@ -459,6 +560,7 @@ def estimate_vehicle_color(
         suppress_skin=False,
         apply_center_weight=True,
         allow_ir=allow_ir,
+        wb_gains=wb_gains,
     )
 
 
@@ -466,6 +568,7 @@ def estimate_clothing_colors(
     person_crop: np.ndarray,
     *,
     allow_ir: bool = False,
+    wb_gains: tuple[float, float, float] | None = None,
 ) -> tuple[str, str, str]:
     """Extrai cor predominante da vestimenta superior e inferior de uma pessoa rastreada."""
     if person_crop is None or person_crop.size == 0:
@@ -483,6 +586,7 @@ def estimate_clothing_colors(
         suppress_skin=True,
         apply_center_weight=True,
         allow_ir=allow_ir,
+        wb_gains=wb_gains,
     )
 
     # Calça/bermuda/saia (54%..85% da altura) apenas quando o enquadramento mostra corpo inferior
@@ -495,6 +599,7 @@ def estimate_clothing_colors(
             suppress_skin=True,
             apply_center_weight=True,
             allow_ir=allow_ir,
+            wb_gains=wb_gains,
         )
     else:
         lower_color = "Não visível"
@@ -1177,6 +1282,7 @@ class CCTVAnalyticsPipeline:
         now = time.monotonic()
         h, w = frame.shape[:2]
         frame_ir = is_ir_frame(frame)
+        frame_wb_gains = (1.0, 1.0, 1.0) if frame_ir else compute_gray_world_gains(frame)
         raw_dets = self._detector.detect(  # type: ignore[attr-defined]
             frame,
             detect_people=self.detect_people_gender,
@@ -1211,7 +1317,9 @@ class CCTVAnalyticsPipeline:
                         immediate_csv = True
 
                 if self.detect_people_gender and self._can_run_secondary(track_id, now):
-                    if self._update_person_attributes(track_id, crop, quality=quality, frame_ir=frame_ir):
+                    if self._update_person_attributes(
+                        track_id, crop, quality=quality, frame_ir=frame_ir, wb_gains=frame_wb_gains
+                    ):
                         table_dirty = True
 
                 with self._lock:
@@ -1268,7 +1376,12 @@ class CCTVAnalyticsPipeline:
 
                 if self.detect_vehicles_alpr and self._can_run_secondary(track_id, now):
                     if self._update_vehicle_attributes(
-                        track_id, crop, category, quality=quality, frame_ir=frame_ir
+                        track_id,
+                        crop,
+                        category,
+                        quality=quality,
+                        frame_ir=frame_ir,
+                        wb_gains=frame_wb_gains,
                     ):
                         table_dirty = True
                         with self._lock:
@@ -1352,13 +1465,14 @@ class CCTVAnalyticsPipeline:
         crop: np.ndarray,
         quality: float = 1.0,
         frame_ir: bool = False,
+        wb_gains: tuple[float, float, float] | None = None,
     ) -> bool:
         g_label = "Indeterminado"
         g_conf = 0.0
         if self._gender_clf is not None:
             g_label, g_conf = self._gender_clf.predict(crop)  # type: ignore[attr-defined]
 
-        upper_c, lower_c, _ = estimate_clothing_colors(crop, allow_ir=frame_ir)
+        upper_c, lower_c, _ = estimate_clothing_colors(crop, allow_ir=frame_ir, wb_gains=wb_gains)
 
         changed = False
         with self._lock:
@@ -1371,14 +1485,20 @@ class CCTVAnalyticsPipeline:
                     changed = True
 
             if upper_c != "Indefinida":
-                u_weight = quality * (0.35 if upper_c.startswith("P&B") else 1.0)
+                u_weight = quality * (
+                    0.35 if upper_c.startswith("P&B") else (0.40 if upper_c == "Escura" else 1.0)
+                )
                 best_u, _ = _accumulate_weighted_vote(prec.upper_color_votes, upper_c, u_weight)
                 if best_u and best_u != prec.upper_color:
                     prec.upper_color = best_u
                     changed = True
 
             if lower_c != "Indefinida":
-                l_weight = quality * (0.25 if lower_c == "Não visível" else (0.35 if lower_c.startswith("P&B") else 1.0))
+                l_weight = quality * (
+                    0.25
+                    if lower_c == "Não visível"
+                    else (0.35 if lower_c.startswith("P&B") else (0.40 if lower_c == "Escura" else 1.0))
+                )
                 best_l, _ = _accumulate_weighted_vote(prec.lower_color_votes, lower_c, l_weight)
                 if best_l and best_l != prec.lower_color:
                     prec.lower_color = best_l
@@ -1398,13 +1518,16 @@ class CCTVAnalyticsPipeline:
         vehicle_type: str,
         quality: float = 1.0,
         frame_ir: bool | None = None,
+        wb_gains: tuple[float, float, float] | None = None,
     ) -> bool:
         plate = ""
         plate_conf = 0.0
         if self._alpr is not None:
             plate, plate_conf = self._alpr.read_plate(crop)  # type: ignore[attr-defined]
 
-        color = estimate_vehicle_color(crop, vehicle_type=vehicle_type, allow_ir=frame_ir)
+        color = estimate_vehicle_color(
+            crop, vehicle_type=vehicle_type, allow_ir=frame_ir, wb_gains=wb_gains
+        )
 
         model_name = ""
         model_conf = 0.0
@@ -1415,7 +1538,9 @@ class CCTVAnalyticsPipeline:
         with self._lock:
             rec = self._vehicles[track_id]
             if color != "Indefinida":
-                c_weight = quality * (0.25 if color.startswith("P&B") else 1.0)
+                c_weight = quality * (
+                    0.25 if color.startswith("P&B") else (0.40 if color == "Escura" else 1.0)
+                )
                 best_color, _ = _accumulate_weighted_vote(rec.color_votes, color, c_weight)
                 if best_color and best_color != rec.color:
                     rec.color = best_color

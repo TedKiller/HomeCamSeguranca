@@ -45,7 +45,9 @@ from dvr_playback import (
     TimelineEvent,
     TimelineSegment,
 )
+from frame_interpolator import LiveFrameInterpolator, interpolate_video_ffmpeg
 from gdrive_uploader import GoogleDriveUploader
+from image_enhancer import SuperResolutionEnhancer
 from ptz_control import create_ptz_backend
 from recorder import VideoRecorder, is_valid_mp4_file
 
@@ -357,9 +359,10 @@ class HeadlessNVRService:
         self._frame_seq = 0
         self._latest_frame: np.ndarray | None = None
         self._last_frame_wall: float = 0.0
-        self._cached_jpeg_key: tuple[int, bool, int] | None = None
+        self._cached_jpeg_key: tuple[int, bool, bool, int] | None = None
         self._cached_jpeg_bytes: bytes | None = None
         self._frame_cond = threading.Condition()
+        self.enhancer = SuperResolutionEnhancer()
 
         self._ptz_lock = threading.Lock()
         self._ptz_client: object | None = None
@@ -630,7 +633,35 @@ class HeadlessNVRService:
             self._frame_seq += 1
             self._frame_cond.notify_all()
 
-    def get_latest_jpeg(self, with_overlays: bool = True, quality: int = 80) -> bytes | None:
+    def encode_frame_jpeg(
+        self,
+        frame: np.ndarray,
+        *,
+        with_overlays: bool = True,
+        quality: int = 80,
+        enhance: bool = False,
+    ) -> bytes | None:
+        """Codifica um quadro BGR em JPEG aplicando nitidez e overlays opcionais."""
+        if frame is None or frame.size == 0:
+            return None
+        render = frame
+        if enhance:
+            render = self.enhancer.enhance_frame(render, upscale=False)
+        if with_overlays and self.enable_ai and self.config.ai.show_overlays:
+            dets = self.ai_pipeline.get_overlay_detections()
+            if dets:
+                render = draw_ai_overlays(render, dets)
+        ok, encoded = cv2.imencode(
+            ".jpg", render, [int(cv2.IMWRITE_JPEG_QUALITY), max(30, min(95, int(quality)))]
+        )
+        return encoded.tobytes() if ok else None
+
+    def get_latest_jpeg(
+        self,
+        with_overlays: bool = True,
+        quality: int = 80,
+        enhance: bool = False,
+    ) -> bytes | None:
         """Codifica em JPEG o quadro mais recente (com cache por sequência para múltiplos clientes)."""
         with self._frame_cond:
             seq = self._frame_seq
@@ -641,33 +672,41 @@ class HeadlessNVRService:
         if frame is None:
             return None
 
-        key = (seq, bool(with_overlays), int(quality))
+        key = (seq, bool(with_overlays), bool(enhance), int(quality))
         if cached_key == key and cached_bytes is not None:
             return cached_bytes
 
-        render = frame
-        if with_overlays and self.enable_ai and self.config.ai.show_overlays:
-            dets = self.ai_pipeline.get_overlay_detections()
-            if dets:
-                render = draw_ai_overlays(frame, dets)
-
-        ok, encoded = cv2.imencode(".jpg", render, [int(cv2.IMWRITE_JPEG_QUALITY), max(30, min(95, int(quality)))])
-        if not ok:
+        jpg_bytes = self.encode_frame_jpeg(
+            frame, with_overlays=with_overlays, quality=quality, enhance=enhance
+        )
+        if jpg_bytes is None:
             return None
-        jpg_bytes = encoded.tobytes()
         with self._frame_cond:
             if self._frame_seq == seq:
                 self._cached_jpeg_key = key
                 self._cached_jpeg_bytes = jpg_bytes
         return jpg_bytes
 
-    def wait_next_jpeg(self, last_seq: int, timeout: float = 2.0, with_overlays: bool = True) -> tuple[int, bytes | None]:
+    def wait_next_frame(self, last_seq: int, timeout: float = 2.0) -> tuple[int, np.ndarray | None]:
+        """Aguarda um novo frame bruto além de `last_seq` e retorna `(novo_seq, frame_bgr)`."""
+        with self._frame_cond:
+            if self._frame_seq == last_seq and not self._stop_event.is_set():
+                self._frame_cond.wait(timeout=max(0.1, float(timeout)))
+            return (self._frame_seq, self._latest_frame)
+
+    def wait_next_jpeg(
+        self,
+        last_seq: int,
+        timeout: float = 2.0,
+        with_overlays: bool = True,
+        enhance: bool = False,
+    ) -> tuple[int, bytes | None]:
         """Aguarda um novo frame além de `last_seq` e retorna `(novo_seq, jpeg_bytes)`."""
         with self._frame_cond:
             if self._frame_seq == last_seq and not self._stop_event.is_set():
                 self._frame_cond.wait(timeout=max(0.1, float(timeout)))
             seq = self._frame_seq
-        return (seq, self.get_latest_jpeg(with_overlays=with_overlays))
+        return (seq, self.get_latest_jpeg(with_overlays=with_overlays, enhance=enhance))
 
     def get_status_payload(self) -> dict[str, object]:
         """Retorna estado completo do motor 24/7 para a API REST / Portal Web."""
@@ -764,6 +803,46 @@ class HeadlessNVRService:
             }
             for r in records
         ]
+
+    def get_detections_payload(self) -> dict[str, object]:
+        """Retorna as detecções ativas com coordenadas normalizadas (0..1) para overlay HTML."""
+        with self._frame_cond:
+            frame = self._latest_frame
+        if frame is not None and len(frame.shape) >= 2:
+            frame_h, frame_w = int(frame.shape[0]), int(frame.shape[1])
+        else:
+            frame_w, frame_h = 1280, 720
+        dets = self.ai_pipeline.get_overlay_detections() if self.enable_ai else []
+        inv_w = 1.0 / max(1, frame_w)
+        inv_h = 1.0 / max(1, frame_h)
+        items = []
+        for det in dets:
+            x1, y1, x2, y2 = det.bbox
+            nx = max(0.0, min(1.0, x1 * inv_w))
+            ny = max(0.0, min(1.0, y1 * inv_h))
+            nw = max(0.005, min(1.0 - nx, (x2 - x1) * inv_w))
+            nh = max(0.005, min(1.0 - ny, (y2 - y1) * inv_h))
+            items.append(
+                {
+                    "track_id": int(det.track_id),
+                    "category": det.category,
+                    "label": det.label,
+                    "x": round(nx, 5),
+                    "y": round(ny, 5),
+                    "w": round(nw, 5),
+                    "h": round(nh, 5),
+                    "confidence": round(float(det.confidence), 3),
+                    "plate": det.plate,
+                    "color": det.color,
+                    "approx_model": det.approx_model,
+                }
+            )
+        return {
+            "frame_width": frame_w,
+            "frame_height": frame_h,
+            "show_overlays": bool(self.config.ai.show_overlays),
+            "detections": items,
+        }
 
     def get_timeline_dates(self, camera_name: str | None = None, include_cloud: bool = True) -> list[str]:
         cam = camera_name or self.selected_camera.name
@@ -880,6 +959,40 @@ class HeadlessNVRService:
             if cache_candidate.exists() and is_valid_mp4_file(cache_candidate):
                 return cache_candidate
             return self.uploader.download_remote_file(file_id, cache_candidate)
+
+    def export_interpolated_video(
+        self,
+        date_str: str,
+        filename: str,
+        *,
+        camera_name: str | None = None,
+        drive_file_id: str = "",
+        target_fps: int = 30,
+        enhance: bool = False,
+    ) -> Path:
+        """Gera versão interpolada (>= 30 FPS constantes) e opcionalmente restaurada de um clipe."""
+        src = self.resolve_video_path(
+            date_str, filename, camera_name=camera_name, drive_file_id=drive_file_id
+        )
+        fps = max(30, min(60, int(target_fps)))
+        cam = camera_name or self.selected_camera.name
+        cam_part = sanitize_filename_part(cam, "Camera")
+        suffix = f"_{fps}fps{'_enh' if enhance else ''}.mp4"
+        out_path = (
+            DVRTimelineIndex.playback_cache_dir(self.recordings_root)
+            / "_export_30fps"
+            / cam_part
+            / date_str
+            / f"{src.stem}{suffix}"
+        )
+        lock_key = f"export/{cam_part}/{date_str}/{out_path.name}"
+        with self._download_lock:
+            per_file_lock = self._file_download_locks.setdefault(lock_key, threading.Lock())
+        with per_file_lock:
+            if out_path.exists() and is_valid_mp4_file(out_path):
+                return out_path
+            interpolate_video_ffmpeg(src, out_path, target_fps=fps, enhance=enhance)
+        return out_path
 
     def ptz_move(self, direction: str, duration_sec: float = 0.35, speed: int | None = None) -> tuple[bool, str]:
         """Executa um passo direcional PTZ seguro remotamente pela API Web."""

@@ -1291,6 +1291,26 @@ class AIAnalyticsTests(unittest.TestCase):
         self.assertEqual(lower_b, "Não visível")
         self.assertIn("Sup: Vermelho", summary_b)
 
+    def test_color_white_balance_and_low_confidence_fallback(self) -> None:
+        from ai_analytics import _classify_roi_color, compute_gray_world_gains, estimate_vehicle_color
+
+        # Simula frame CCTV com forte viés azulado (céu/AWB frio) e carro preto na sombra
+        frame = np.full((240, 320, 3), (158, 152, 125), dtype=np.uint8)
+        gains = compute_gray_world_gains(frame)
+        self.assertLess(gains[0], gains[2])
+
+        dark_cool_car = np.full((100, 120, 3), (58, 44, 34), dtype=np.uint8)
+        self.assertNotEqual(estimate_vehicle_color(dark_cool_car, wb_gains=gains), "Azul")
+
+        # Mistura caótica de várias cores sem predominância clara -> fallback Escura/Indefinida
+        noisy = np.zeros((48, 48, 3), dtype=np.uint8)
+        noisy[:12, :] = (20, 20, 210)
+        noisy[12:24, :] = (20, 200, 20)
+        noisy[24:36, :] = (210, 40, 20)
+        noisy[36:, :] = (20, 200, 210)
+        res = _classify_roi_color(noisy, apply_center_weight=False)
+        self.assertIn(res, ("Escura", "Indefinida"))
+
     def test_class_aware_iou_tracker(self) -> None:
         from ai_analytics import ClassAwareIoUTracker
 
@@ -2062,10 +2082,27 @@ class HeadlessAndWebPortalTests(unittest.TestCase):
                     chunk = vresp.read()
                     self.assertEqual(chunk, mp4_path.read_bytes()[:64])
 
-                # Snapshot JPEG ao vivo e CSV remoto
+                # Snapshot JPEG ao vivo (normal e aprimorado) e CSV remoto
                 with urllib.request.urlopen(f"{base}/api/snapshot.jpg?token=segredo-24h", timeout=3.0) as sresp:
                     jpg = sresp.read()
                     self.assertTrue(jpg.startswith(b"\xff\xd8"))
+                with urllib.request.urlopen(f"{base}/api/snapshot.jpg?enhance=1&token=segredo-24h", timeout=3.0) as eresp:
+                    ejpg = eresp.read()
+                    self.assertTrue(ejpg.startswith(b"\xff\xd8"))
+
+                # Exportação de clipe DVR interpolado em 30 FPS constantes + nitidez
+                with urllib.request.urlopen(
+                    f"{base}/api/video/export?date=2026-11-13&file={mp4_path.name}&fps=30&enhance=1&token=segredo-24h",
+                    timeout=10.0,
+                ) as exp_resp:
+                    self.assertEqual(exp_resp.status, 200)
+                    exp_bytes = exp_resp.read()
+                    self.assertIn(b"ftyp", exp_bytes[:64])
+                    exp_tmp = root / "exported_30.mp4"
+                    exp_tmp.write_bytes(exp_bytes)
+                    ecap = cv2.VideoCapture(str(exp_tmp))
+                    self.assertGreaterEqual(ecap.get(cv2.CAP_PROP_FPS), 29.9)
+                    ecap.release()
 
                 with urllib.request.urlopen(f"{base}/api/export/vehicles.csv?token=segredo-24h", timeout=3.0) as cresp:
                     csv_txt = cresp.read().decode("utf-8-sig")
@@ -2088,6 +2125,99 @@ class HeadlessAndWebPortalTests(unittest.TestCase):
             finally:
                 server.stop()
                 nvr.stop()
+
+    def test_image_enhancer_and_super_resolution(self) -> None:
+        from image_enhancer import (
+            SuperResolutionEnhancer,
+            enhance_video_file,
+            restore_texture_and_denoise,
+        )
+
+        # Imagem com ruído de sensor em baixa luz + borda nítida simulando placa/tecido
+        rng = np.random.default_rng(42)
+        base = np.full((64, 96, 3), 50, dtype=np.uint8)
+        cv2.rectangle(base, (24, 18), (72, 46), (220, 220, 220), -1)
+        noise = rng.integers(-12, 13, size=base.shape, dtype=np.int16)
+        noisy = np.clip(base.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        cleaned = restore_texture_and_denoise(noisy, denoise_strength=0.6, sharpen_amount=0.5)
+        self.assertEqual(cleaned.shape, noisy.shape)
+        self.assertEqual(cleaned.dtype, np.uint8)
+        # Região plana deve ter variância de ruído reduzida mantendo contraste da borda
+        self.assertLess(float(np.std(cleaned[2:14, 2:18])), float(np.std(noisy[2:14, 2:18])))
+
+        enh = SuperResolutionEnhancer(scale=2)
+        up2 = enh.enhance_roi(noisy, scale=2)
+        self.assertEqual(up2.shape, (128, 192, 3))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_mp4 = Path(tmp) / "in.mp4"
+            dst_mp4 = Path(tmp) / "out.mp4"
+            writer = cv2.VideoWriter(str(src_mp4), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (96, 64))
+            for _ in range(3):
+                writer.write(noisy)
+            writer.release()
+
+            stats = enhance_video_file(src_mp4, dst_mp4, enhancer=enh, upscale=True, scale=2)
+            self.assertEqual(stats["frames"], 3)
+            self.assertEqual(stats["width"], 192)
+            self.assertEqual(stats["height"], 128)
+            self.assertTrue(dst_mp4.exists() and dst_mp4.stat().st_size > 0)
+
+    def test_frame_interpolator_30fps(self) -> None:
+        from frame_interpolator import (
+            LiveFrameInterpolator,
+            _is_scene_cut,
+            interpolate_video_ffmpeg,
+            interpolate_video_python,
+            optical_flow_interpolate_pair,
+        )
+
+        # Quadrado branco deslocando-se 16px para a direita -> meio termo deve mover o objeto
+        fa = np.zeros((64, 96, 3), dtype=np.uint8)
+        fb = np.zeros((64, 96, 3), dtype=np.uint8)
+        cv2.rectangle(fa, (16, 20), (36, 44), (240, 240, 240), -1)
+        cv2.rectangle(fb, (32, 20), (52, 44), (240, 240, 240), -1)
+        mid = optical_flow_interpolate_pair(fa, fb, t=0.5)
+        self.assertEqual(mid.shape, fa.shape)
+        self.assertGreater(float(np.mean(mid[22:42, 26:42])), 150.0)
+
+        live_interp = LiveFrameInterpolator(max_flow_width=64)
+        mids = live_interp.interpolate_intermediate_frames(fa, fb, subframes=2)
+        self.assertEqual(len(mids), 2)
+        self.assertEqual(mids[0].shape, fa.shape)
+
+        # Corte de cena brusco (azul -> vermelho) não deve gerar ghosting
+        blue = np.full((64, 96, 3), (220, 20, 20), dtype=np.uint8)
+        red = np.full((64, 96, 3), (20, 20, 220), dtype=np.uint8)
+        self.assertTrue(_is_scene_cut(blue, red))
+        cut_mid = optical_flow_interpolate_pair(blue, red, t=0.4)
+        self.assertGreater(int(cut_mid[32, 48, 0]), 180)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_10fps.mp4"
+            out_py = Path(tmp) / "out_py_30fps.mp4"
+            out_ff = Path(tmp) / "out_ff_30fps.mp4"
+            writer = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (96, 64))
+            for i in range(10):  # 1.0 segundo a 10 FPS
+                f = np.zeros((64, 96, 3), dtype=np.uint8)
+                x = 8 + i * 6
+                cv2.rectangle(f, (x, 20), (x + 18, 44), (230, 230, 230), -1)
+                writer.write(f)
+            writer.release()
+
+            res_py = interpolate_video_python(src, out_py, target_fps=30)
+            self.assertGreaterEqual(res_py["target_fps"], 30.0)
+            self.assertEqual(res_py["out_frames"], 30)
+            cap_py = cv2.VideoCapture(str(out_py))
+            self.assertGreaterEqual(cap_py.get(cv2.CAP_PROP_FPS), 29.9)
+            cap_py.release()
+
+            res_ff = interpolate_video_ffmpeg(src, out_ff, target_fps=30)
+            self.assertEqual(res_ff["target_fps"], 30)
+            cap_ff = cv2.VideoCapture(str(out_ff))
+            self.assertGreaterEqual(cap_ff.get(cv2.CAP_PROP_FPS), 29.9)
+            cap_ff.release()
 
 
 if __name__ == "__main__":
